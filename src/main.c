@@ -57,11 +57,12 @@ static void button_pressed(const struct device *dev,
         if (pins & BIT(buttons[i].pin)) {
 
             if (compartments[i].is_open) {
-
                 gpio_pin_set_dt(&leds[i], 0);
                 compartments[i].is_open = false;
 
-                LOG_INF("Compartment %d closed by user", i);
+                LOG_INF("HARDWARE: Compartment %d physically CLOSED by user", i);
+            } else {
+                LOG_INF("HARDWARE: Button %d pressed, but compartment is already closed", i);
             }
         }
     }
@@ -101,6 +102,8 @@ static int on_locker_status(struct http_client_ctx *client,
     if (status != HTTP_SERVER_DATA_FINAL)
         return 0;
 
+    LOG_INF("API REQUEST: GET /locker/status");
+
     int len = snprintf(body, sizeof(body),
         "{\"locker_id\":\"locker-demo-001\",\"status\":\"online\",\"compartments\":%d}",
         COMPARTMENT_COUNT);
@@ -109,6 +112,8 @@ static int on_locker_status(struct http_client_ctx *client,
     res->body = (uint8_t *)body;
     res->body_len = len;
     res->final_chunk = true;
+
+    LOG_INF("API RESPONSE: %s", body);
 
     return 0;
 }
@@ -125,6 +130,8 @@ static int on_compartments_list(struct http_client_ctx *client,
 
     if (status != HTTP_SERVER_DATA_FINAL)
         return 0;
+
+    LOG_INF("API REQUEST: GET /compartments");
 
     int offset = 0;
 
@@ -147,6 +154,8 @@ static int on_compartments_list(struct http_client_ctx *client,
     res->body_len = offset;
     res->final_chunk = true;
 
+    LOG_INF("API RESPONSE: %s", body);
+
     return 0;
 }
 
@@ -156,7 +165,10 @@ static int open_compartment(int id, struct http_response_ctx *res)
 {
     static char body[64];
 
+    LOG_INF("API REQUEST: POST /compartments/%d/open", id);
+
     if (id < 0 || id >= COMPARTMENT_COUNT) {
+        LOG_WRN("API ERROR: Invalid compartment ID %d", id);
         res->status = HTTP_400_BAD_REQUEST;
         return 0;
     }
@@ -173,6 +185,8 @@ static int open_compartment(int id, struct http_response_ctx *res)
     res->body_len = len;
     res->final_chunk = true;
 
+    LOG_INF("API RESPONSE: %s", body);
+
     return 0;
 }
 
@@ -180,7 +194,10 @@ static int close_compartment_api(int id, struct http_response_ctx *res)
 {
     static char body[64];
 
+    LOG_INF("API REQUEST: POST /compartments/%d/close", id);
+
     if (id < 0 || id >= COMPARTMENT_COUNT) {
+        LOG_WRN("API ERROR: Invalid compartment ID %d", id);
         res->status = HTTP_400_BAD_REQUEST;
         return 0;
     }
@@ -194,6 +211,8 @@ static int close_compartment_api(int id, struct http_response_ctx *res)
     res->body = (uint8_t *)body;
     res->body_len = len;
     res->final_chunk = true;
+
+    LOG_INF("API RESPONSE: %s", body);
 
     return 0;
 }
@@ -333,23 +352,23 @@ int main(void)
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
 
-    if (!device_is_ready(buttons[i].port)) {
-        LOG_ERR("Button %d not ready", i);
-        continue;
+        if (!device_is_ready(buttons[i].port)) {
+            LOG_ERR("Button %d not ready", i);
+            continue;
+        }
+
+        gpio_pin_configure_dt(&buttons[i], GPIO_INPUT);
+
+        gpio_pin_interrupt_configure_dt(&buttons[i],
+                                        GPIO_INT_EDGE_TO_ACTIVE);
+
+        gpio_init_callback(&button_cb_data[i],
+                           button_pressed,
+                           BIT(buttons[i].pin));
+
+        gpio_add_callback(buttons[i].port,
+                          &button_cb_data[i]);
     }
-
-    gpio_pin_configure_dt(&buttons[i], GPIO_INPUT);
-
-    gpio_pin_interrupt_configure_dt(&buttons[i],
-                                    GPIO_INT_EDGE_TO_ACTIVE);
-
-    gpio_init_callback(&button_cb_data[i],
-                       button_pressed,
-                       BIT(buttons[i].pin));
-
-    gpio_add_callback(buttons[i].port,
-                      &button_cb_data[i]);
-}
 
     init_compartments();
 
