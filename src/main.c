@@ -35,20 +35,10 @@ struct compartment {
 static struct compartment compartments[COMPARTMENT_COUNT];
 
 static struct k_work open_compartment_work;
-static struct k_work_delayable close_compartment_work;
 
 static int active_compartment = -1;
 
-/* ================= GPIO WORK ================= */
-
-static void close_compartment_handler(struct k_work *item)
-{
-    if (active_compartment < 0 || active_compartment >= COMPARTMENT_COUNT)
-        return;
-
-    gpio_pin_set_dt(&leds[active_compartment], 0);
-    compartments[active_compartment].is_open = false;
-}
+/* ================= GPIO ================= */
 
 static void open_compartment_handler(struct k_work *item)
 {
@@ -56,7 +46,15 @@ static void open_compartment_handler(struct k_work *item)
         return;
 
     gpio_pin_set_dt(&leds[active_compartment], 1);
-    k_work_schedule(&close_compartment_work, K_SECONDS(2));
+}
+
+static void close_compartment(int id)
+{
+    if (id < 0 || id >= COMPARTMENT_COUNT)
+        return;
+
+    gpio_pin_set_dt(&leds[id], 0);
+    compartments[id].is_open = false;
 }
 
 /* ================= INIT ================= */
@@ -133,8 +131,7 @@ static int on_compartments_list(struct http_client_ctx *client,
 
 /* ================= OPEN ================= */
 
-static int open_compartment(int id,
-                            struct http_response_ctx *res)
+static int open_compartment(int id, struct http_response_ctx *res)
 {
     static char body[64];
 
@@ -159,58 +156,67 @@ static int open_compartment(int id,
     return 0;
 }
 
-static int open0_cb(struct http_client_ctx *client,
-                    enum http_data_status status,
-                    const struct http_request_ctx *req,
-                    struct http_response_ctx *res,
-                    void *user_data)
+static int close_compartment_api(int id, struct http_response_ctx *res)
 {
-    if (status != HTTP_SERVER_DATA_FINAL) return 0;
-    return open_compartment(0, res);
+    static char body[64];
+
+    if (id < 0 || id >= COMPARTMENT_COUNT) {
+        res->status = HTTP_400_BAD_REQUEST;
+        return 0;
+    }
+
+    close_compartment(id);
+
+    int len = snprintf(body, sizeof(body),
+        "{\"status\":\"closed\",\"id\":%d}", id);
+
+    res->status = HTTP_200_OK;
+    res->body = (uint8_t *)body;
+    res->body_len = len;
+    res->final_chunk = true;
+
+    return 0;
 }
 
-static int open1_cb(struct http_client_ctx *client,
-                    enum http_data_status status,
-                    const struct http_request_ctx *req,
-                    struct http_response_ctx *res,
-                    void *user_data)
-{
-    if (status != HTTP_SERVER_DATA_FINAL) return 0;
-    return open_compartment(1, res);
+/* ================= CALLBACKS ================= */
+
+#define OPEN_CB(ID) \
+static int open##ID##_cb(struct http_client_ctx *client, \
+                         enum http_data_status status, \
+                         const struct http_request_ctx *req, \
+                         struct http_response_ctx *res, \
+                         void *user_data) \
+{ \
+    if (status != HTTP_SERVER_DATA_FINAL) return 0; \
+    return open_compartment(ID, res); \
 }
 
-static int open2_cb(struct http_client_ctx *client,
-                    enum http_data_status status,
-                    const struct http_request_ctx *req,
-                    struct http_response_ctx *res,
-                    void *user_data)
-{
-    if (status != HTTP_SERVER_DATA_FINAL) return 0;
-    return open_compartment(2, res);
+#define CLOSE_CB(ID) \
+static int close##ID##_cb(struct http_client_ctx *client, \
+                          enum http_data_status status, \
+                          const struct http_request_ctx *req, \
+                          struct http_response_ctx *res, \
+                          void *user_data) \
+{ \
+    if (status != HTTP_SERVER_DATA_FINAL) return 0; \
+    return close_compartment_api(ID, res); \
 }
 
-static int open3_cb(struct http_client_ctx *client,
-                    enum http_data_status status,
-                    const struct http_request_ctx *req,
-                    struct http_response_ctx *res,
-                    void *user_data)
-{
-    if (status != HTTP_SERVER_DATA_FINAL) return 0;
-    return open_compartment(3, res);
-}
+OPEN_CB(0)
+OPEN_CB(1)
+OPEN_CB(2)
+OPEN_CB(3)
+
+CLOSE_CB(0)
+CLOSE_CB(1)
+CLOSE_CB(2)
+CLOSE_CB(3)
 
 /* ================= HTTP SERVER ================= */
 
 static uint16_t service_port = 8080;
 
-HTTP_SERVICE_DEFINE(locker_svc,
-                    "0.0.0.0",
-                    &service_port,
-                    2,
-                    10,
-                    NULL,
-                    NULL,
-                    NULL);
+HTTP_SERVICE_DEFINE(locker_svc, "0.0.0.0", &service_port, 2, 10, NULL, NULL, NULL);
 
 static struct http_resource_detail_dynamic status_detail = {
     .common = {
@@ -220,10 +226,7 @@ static struct http_resource_detail_dynamic status_detail = {
     .cb = on_locker_status,
 };
 
-HTTP_RESOURCE_DEFINE(status_resource,
-                     locker_svc,
-                     "/locker/status",
-                     &status_detail);
+HTTP_RESOURCE_DEFINE(status_resource, locker_svc, "/locker/status", &status_detail);
 
 static struct http_resource_detail_dynamic list_detail = {
     .common = {
@@ -233,12 +236,9 @@ static struct http_resource_detail_dynamic list_detail = {
     .cb = on_compartments_list,
 };
 
-HTTP_RESOURCE_DEFINE(list_resource,
-                     locker_svc,
-                     "/compartments",
-                     &list_detail);
+HTTP_RESOURCE_DEFINE(list_resource, locker_svc, "/compartments", &list_detail);
 
-/* OPEN ENDPOINTS */
+/* ===== OPEN endpoints ===== */
 
 #define OPEN_RESOURCE(ID) \
 static struct http_resource_detail_dynamic open##ID##_detail = { \
@@ -257,6 +257,26 @@ OPEN_RESOURCE(0)
 OPEN_RESOURCE(1)
 OPEN_RESOURCE(2)
 OPEN_RESOURCE(3)
+
+/* ===== CLOSE endpoints ===== */
+
+#define CLOSE_RESOURCE(ID) \
+static struct http_resource_detail_dynamic close##ID##_detail = { \
+    .common = { \
+        .type = HTTP_RESOURCE_TYPE_DYNAMIC, \
+        .bitmask_of_supported_http_methods = BIT(HTTP_POST), \
+    }, \
+    .cb = close##ID##_cb, \
+}; \
+HTTP_RESOURCE_DEFINE(close##ID##_resource, \
+                     locker_svc, \
+                     "/compartments/"#ID"/close", \
+                     &close##ID##_detail);
+
+CLOSE_RESOURCE(0)
+CLOSE_RESOURCE(1)
+CLOSE_RESOURCE(2)
+CLOSE_RESOURCE(3)
 
 /* ================= LTE ================= */
 
@@ -294,15 +314,10 @@ int main(void)
     init_compartments();
 
     k_work_init(&open_compartment_work, open_compartment_handler);
-    k_work_init_delayable(&close_compartment_work, close_compartment_handler);
 
     err = nrf_modem_lib_init();
-    if (err) {
-        LOG_ERR("Modem init failed");
+    if (err)
         return err;
-    }
-
-    LOG_INF("Connecting LTE");
 
     err = lte_lc_connect_async(lte_handler);
     if (err)
