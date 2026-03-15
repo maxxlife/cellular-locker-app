@@ -2,30 +2,30 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/net/socket.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 #include <zephyr/logging/log.h>
 #include <modem/lte_lc.h>
 #include <modem/nrf_modem_lib.h>
 #include <stdio.h>
-#include <stdlib.h>
 
-LOG_MODULE_REGISTER(locker_app, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(locker_app, LOG_LEVEL_INF);
 
 static K_SEM_DEFINE(lte_connected, 0, 1);
 
-/* Work items for non-blocking GPIO operations */
-static struct k_work open_compartment_work;
-static struct k_work_delayable close_compartment_work;
+#define COMPARTMENT_COUNT 4
 
-#define PORT 80
-#define COMPARTMENT_COUNT 6
-
-/* The devicetree node identifier for the "led0" alias. */
 #define LED0_NODE DT_ALIAS(led0)
+#define LED1_NODE DT_ALIAS(led1)
+#define LED2_NODE DT_ALIAS(led2)
+#define LED3_NODE DT_ALIAS(led3)
 
-static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+static const struct gpio_dt_spec leds[COMPARTMENT_COUNT] = {
+    GPIO_DT_SPEC_GET(LED0_NODE, gpios),
+    GPIO_DT_SPEC_GET(LED1_NODE, gpios),
+    GPIO_DT_SPEC_GET(LED2_NODE, gpios),
+    GPIO_DT_SPEC_GET(LED3_NODE, gpios),
+};
 
 struct compartment {
     int id;
@@ -34,23 +34,32 @@ struct compartment {
 
 static struct compartment compartments[COMPARTMENT_COUNT];
 
-/* Handler to turn the LED off */
+static struct k_work open_compartment_work;
+static struct k_work_delayable close_compartment_work;
+
+static int active_compartment = -1;
+
+/* ================= GPIO WORK ================= */
+
 static void close_compartment_handler(struct k_work *item)
 {
-    if (device_is_ready(led.port)) {
-        gpio_pin_set_dt(&led, 0);
-    }
+    if (active_compartment < 0 || active_compartment >= COMPARTMENT_COUNT)
+        return;
+
+    gpio_pin_set_dt(&leds[active_compartment], 0);
+    compartments[active_compartment].is_open = false;
 }
 
-/* Handler to turn the LED on and schedule it to turn off */
 static void open_compartment_handler(struct k_work *item)
 {
-    if (device_is_ready(led.port)) {
-        gpio_pin_set_dt(&led, 1);
-        /* Schedule the close handler to run 500ms from now */
-        k_work_schedule(&close_compartment_work, K_MSEC(500));
-    }
+    if (active_compartment < 0 || active_compartment >= COMPARTMENT_COUNT)
+        return;
+
+    gpio_pin_set_dt(&leds[active_compartment], 1);
+    k_work_schedule(&close_compartment_work, K_SECONDS(2));
 }
+
+/* ================= INIT ================= */
 
 static void init_compartments(void)
 {
@@ -60,105 +69,150 @@ static void init_compartments(void)
     }
 }
 
+/* ================= STATUS ================= */
+
 static int on_locker_status(struct http_client_ctx *client,
                             enum http_data_status status,
-                            const struct http_request_ctx *request_ctx,
-                            struct http_response_ctx *response_ctx,
+                            const struct http_request_ctx *req,
+                            struct http_response_ctx *res,
                             void *user_data)
 {
-    static char response_body[128];
+    static char body[128];
 
-    if (status == HTTP_SERVER_DATA_FINAL) {
-        int len = snprintf(response_body, sizeof(response_body),
-                           "{\n\"locker_id\": \"locker-demo-001\",\n\"status\": \"online\",\n\"compartments\": %d\n}",
-                           COMPARTMENT_COUNT);
+    if (status != HTTP_SERVER_DATA_FINAL)
+        return 0;
 
-        response_ctx->status = HTTP_200_OK;
-        response_ctx->body = (uint8_t *)response_body;
-        response_ctx->body_len = len;
-        response_ctx->final_chunk = true;
-    }
+    int len = snprintf(body, sizeof(body),
+        "{\"locker_id\":\"locker-demo-001\",\"status\":\"online\",\"compartments\":%d}",
+        COMPARTMENT_COUNT);
+
+    res->status = HTTP_200_OK;
+    res->body = (uint8_t *)body;
+    res->body_len = len;
+    res->final_chunk = true;
+
     return 0;
 }
+
+/* ================= LIST ================= */
+
 static int on_compartments_list(struct http_client_ctx *client,
                                 enum http_data_status status,
-                                const struct http_request_ctx *request_ctx,
-                                struct http_response_ctx *response_ctx,
+                                const struct http_request_ctx *req,
+                                struct http_response_ctx *res,
                                 void *user_data)
 {
-    static char response_body[512];
+    static char body[256];
 
-    if (status != HTTP_SERVER_DATA_FINAL) {
+    if (status != HTTP_SERVER_DATA_FINAL)
         return 0;
-    }
 
     int offset = 0;
 
-    offset += snprintf(response_body + offset,
-                       sizeof(response_body) - offset,
-                       "[");
+    offset += snprintf(body + offset, sizeof(body) - offset, "[");
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
 
-        offset += snprintf(response_body + offset,
-                           sizeof(response_body) - offset,
+        offset += snprintf(body + offset,
+                           sizeof(body) - offset,
                            "{\"id\":%d,\"state\":\"%s\"}%s",
-                           compartments[i].id,
+                           i,
                            compartments[i].is_open ? "open" : "closed",
                            (i < COMPARTMENT_COUNT - 1) ? "," : "");
     }
 
-    offset += snprintf(response_body + offset,
-                       sizeof(response_body) - offset,
-                       "]");
+    offset += snprintf(body + offset, sizeof(body) - offset, "]");
 
-    response_ctx->status = HTTP_200_OK;
-    response_ctx->headers = "Content-Type: application/json\r\n";
-    response_ctx->body = (uint8_t *)response_body;
-    response_ctx->body_len = offset;
-    response_ctx->final_chunk = true;
+    res->status = HTTP_200_OK;
+    res->body = (uint8_t *)body;
+    res->body_len = offset;
+    res->final_chunk = true;
 
     return 0;
 }
-static int on_compartment_open(struct http_client_ctx *client,
-                               enum http_data_status status,
-                               const struct http_request_ctx *request_ctx,
-                               struct http_response_ctx *response_ctx,
-                               void *user_data)
+
+/* ================= OPEN ================= */
+
+static int open_compartment(int id,
+                            struct http_response_ctx *res)
 {
-    static char response_body[] = "{\"status\":\"success\"}";
+    static char body[64];
 
-    if (status != HTTP_SERVER_DATA_FINAL) {
+    if (id < 0 || id >= COMPARTMENT_COUNT) {
+        res->status = HTTP_400_BAD_REQUEST;
         return 0;
     }
 
-    int id = 0;  /* currently fixed */
-
-    if (id >= COMPARTMENT_COUNT) {
-        response_ctx->status = HTTP_400_BAD_REQUEST;
-        return 0;
-    }
-
+    active_compartment = id;
     compartments[id].is_open = true;
 
     k_work_submit(&open_compartment_work);
 
-    response_ctx->status = HTTP_200_OK;
-    response_ctx->headers = "Content-Type: application/json\r\n";
-    response_ctx->body = (uint8_t *)response_body;
-    response_ctx->body_len = sizeof(response_body) - 1;
-    response_ctx->final_chunk = true;
+    int len = snprintf(body, sizeof(body),
+        "{\"status\":\"opened\",\"id\":%d}", id);
+
+    res->status = HTTP_200_OK;
+    res->body = (uint8_t *)body;
+    res->body_len = len;
+    res->final_chunk = true;
 
     return 0;
 }
 
-/* Resource Definitions */
+static int open0_cb(struct http_client_ctx *client,
+                    enum http_data_status status,
+                    const struct http_request_ctx *req,
+                    struct http_response_ctx *res,
+                    void *user_data)
+{
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
+    return open_compartment(0, res);
+}
+
+static int open1_cb(struct http_client_ctx *client,
+                    enum http_data_status status,
+                    const struct http_request_ctx *req,
+                    struct http_response_ctx *res,
+                    void *user_data)
+{
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
+    return open_compartment(1, res);
+}
+
+static int open2_cb(struct http_client_ctx *client,
+                    enum http_data_status status,
+                    const struct http_request_ctx *req,
+                    struct http_response_ctx *res,
+                    void *user_data)
+{
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
+    return open_compartment(2, res);
+}
+
+static int open3_cb(struct http_client_ctx *client,
+                    enum http_data_status status,
+                    const struct http_request_ctx *req,
+                    struct http_response_ctx *res,
+                    void *user_data)
+{
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
+    return open_compartment(3, res);
+}
+
+/* ================= HTTP SERVER ================= */
 
 static uint16_t service_port = 8080;
 
-HTTP_SERVICE_DEFINE(locker_svc, "0.0.0.0", &service_port, 2, 10, NULL, NULL, NULL);
+HTTP_SERVICE_DEFINE(locker_svc,
+                    "0.0.0.0",
+                    &service_port,
+                    2,
+                    10,
+                    NULL,
+                    NULL,
+                    NULL);
 
-static struct http_resource_detail_dynamic status_resource_detail = {
+static struct http_resource_detail_dynamic status_detail = {
     .common = {
         .type = HTTP_RESOURCE_TYPE_DYNAMIC,
         .bitmask_of_supported_http_methods = BIT(HTTP_GET),
@@ -169,13 +223,12 @@ static struct http_resource_detail_dynamic status_resource_detail = {
 HTTP_RESOURCE_DEFINE(status_resource,
                      locker_svc,
                      "/locker/status",
-                     &status_resource_detail);
+                     &status_detail);
 
-
-static struct http_resource_detail_dynamic list_resource_detail = {
+static struct http_resource_detail_dynamic list_detail = {
     .common = {
         .type = HTTP_RESOURCE_TYPE_DYNAMIC,
-        .bitmask_of_supported_http_methods = BIT(HTTP_GET)
+        .bitmask_of_supported_http_methods = BIT(HTTP_GET),
     },
     .cb = on_compartments_list,
 };
@@ -183,42 +236,59 @@ static struct http_resource_detail_dynamic list_resource_detail = {
 HTTP_RESOURCE_DEFINE(list_resource,
                      locker_svc,
                      "/compartments",
-                     &list_resource_detail);
+                     &list_detail);
 
-static struct http_resource_detail_dynamic open_resource_detail = {
-    .common = {
-        .type = HTTP_RESOURCE_TYPE_DYNAMIC,
-        .bitmask_of_supported_http_methods = BIT(HTTP_POST)
-    },
-    .cb = on_compartment_open,
-};
+/* OPEN ENDPOINTS */
 
-HTTP_RESOURCE_DEFINE(open_resource,
-                     locker_svc,
-                     "/compartments/0/open",
-                     &open_resource_detail);
+#define OPEN_RESOURCE(ID) \
+static struct http_resource_detail_dynamic open##ID##_detail = { \
+    .common = { \
+        .type = HTTP_RESOURCE_TYPE_DYNAMIC, \
+        .bitmask_of_supported_http_methods = BIT(HTTP_POST), \
+    }, \
+    .cb = open##ID##_cb, \
+}; \
+HTTP_RESOURCE_DEFINE(open##ID##_resource, \
+                     locker_svc, \
+                     "/compartments/"#ID"/open", \
+                     &open##ID##_detail);
 
-static void lte_handler(const struct lte_lc_evt *const evt)
+OPEN_RESOURCE(0)
+OPEN_RESOURCE(1)
+OPEN_RESOURCE(2)
+OPEN_RESOURCE(3)
+
+/* ================= LTE ================= */
+
+static void lte_handler(const struct lte_lc_evt *evt)
 {
     if (evt->type == LTE_LC_EVT_NW_REG_STATUS) {
-        if ((evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME) ||
-            (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING)) {
-            LOG_INF("Network attached!");
+
+        if (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ||
+            evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
+
+            LOG_INF("Network attached");
             k_sem_give(&lte_connected);
         }
     }
 }
 
+/* ================= MAIN ================= */
+
 int main(void)
 {
     int err;
 
-    LOG_INF("Starting Cellular Locker Demo on nRF9151-DK");
+    LOG_INF("Cellular Locker Demo");
 
-    if (!device_is_ready(led.port)) {
-        LOG_ERR("LED device not ready");
-    } else {
-        gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+
+        if (!device_is_ready(leds[i].port)) {
+            LOG_ERR("LED %d not ready", i);
+            continue;
+        }
+
+        gpio_pin_configure_dt(&leds[i], GPIO_OUTPUT_INACTIVE);
     }
 
     init_compartments();
@@ -228,29 +298,27 @@ int main(void)
 
     err = nrf_modem_lib_init();
     if (err) {
-        LOG_ERR("Modem library init failed: %d", err);
+        LOG_ERR("Modem init failed");
         return err;
     }
 
-    LOG_INF("Connecting to LTE network...");
+    LOG_INF("Connecting LTE");
+
     err = lte_lc_connect_async(lte_handler);
-    if (err) {
-        LOG_ERR("Failed to initiate LTE connection: %d", err);
+    if (err)
         return err;
-    }
-    
-    k_sem_take(&lte_connected, K_FOREVER);
-    LOG_INF("LTE Connected!");
-    
-    err = http_server_start();
-    if (err) {
-        LOG_ERR("Failed to start HTTP server (%d)", err);
-    } else {
-        LOG_INF("HTTP server started on port %d", service_port);
-    }
 
-    while (1) {
-        k_sleep(K_MSEC(1000));
-    }
-    return 0;
+    k_sem_take(&lte_connected, K_FOREVER);
+
+    LOG_INF("LTE Connected");
+
+    err = http_server_start();
+
+    if (err)
+        LOG_ERR("HTTP server failed");
+    else
+        LOG_INF("HTTP server started on port %d", service_port);
+
+    while (1)
+        k_sleep(K_SECONDS(1));
 }
