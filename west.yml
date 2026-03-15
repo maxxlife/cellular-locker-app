@@ -1,0 +1,12 @@
+manifest:
+  remotes:
+    - name: nrfconnect
+      url-base: https://github.com/nrfconnect
+  projects:
+    - name: sdk-nrf
+      remote: nrfconnect
+      revision: v2.7.0
+      path: nrf
+      import: true
+  self:
+    path: cellular-locker-app

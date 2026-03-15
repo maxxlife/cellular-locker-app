@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20.0)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(cellular-locker-app)
+
+zephyr_linker_sources(SECTIONS sections-rom.ld)
+
+zephyr_linker_section(NAME http_resource_desc_locker_svc KVMA RAM_REGION GROUP RODATA_REGION SUBALIGN Z_LINK_ITERABLE_SUBALIGN)
+
+target_sources(app PRIVATE src/main.c)
