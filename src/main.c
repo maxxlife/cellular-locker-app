@@ -34,19 +34,7 @@ struct compartment {
 
 static struct compartment compartments[COMPARTMENT_COUNT];
 
-static struct k_work open_compartment_work;
-
-static int active_compartment = -1;
-
 /* ================= GPIO ================= */
-
-static void open_compartment_handler(struct k_work *item)
-{
-    if (active_compartment < 0 || active_compartment >= COMPARTMENT_COUNT)
-        return;
-
-    gpio_pin_set_dt(&leds[active_compartment], 1);
-}
 
 static void close_compartment(int id)
 {
@@ -140,10 +128,9 @@ static int open_compartment(int id, struct http_response_ctx *res)
         return 0;
     }
 
-    active_compartment = id;
+    /* Direct, non-blocking hardware toggle resolves the race condition */
+    gpio_pin_set_dt(&leds[id], 1);
     compartments[id].is_open = true;
-
-    k_work_submit(&open_compartment_work);
 
     int len = snprintf(body, sizeof(body),
         "{\"status\":\"opened\",\"id\":%d}", id);
@@ -312,8 +299,6 @@ int main(void)
     }
 
     init_compartments();
-
-    k_work_init(&open_compartment_work, open_compartment_handler);
 
     err = nrf_modem_lib_init();
     if (err)
