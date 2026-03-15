@@ -48,18 +48,67 @@ struct compartment {
 
 static struct compartment compartments[COMPARTMENT_COUNT];
 
+/* ================= SLEEP / WAKE LOGIC ================= */
+
+static struct k_timer inactivity_timer;
+static struct k_work_delayable button_check_work;
+static bool is_sleeping = false;
+
+#define INACTIVITY_TIMEOUT K_SECONDS(60)
+#define BUTTON_DEBOUNCE    K_MSEC(100)
+
+static void reset_inactivity_timer(void)
+{
+    if (!is_sleeping) {
+        k_timer_start(&inactivity_timer, INACTIVITY_TIMEOUT, K_NO_WAIT);
+    }
+}
+
+static void inactivity_timer_handler(struct k_timer *timer_id)
+{
+    is_sleeping = true;
+    LOG_WRN("=========================================");
+    LOG_WRN("   60s INACTIVITY REACHED");
+    LOG_WRN("   Locker is now in APP SLEEP STATE");
+    LOG_WRN("   Press Button 0 + Button 1 to wake");
+    LOG_WRN("=========================================");
+}
+
+static void button_check_handler(struct k_work *work)
+{
+    if (is_sleeping) {
+        // Read raw states of Button 0 and Button 1
+        int b0_pressed = gpio_pin_get_dt(&buttons[0]);
+        int b1_pressed = gpio_pin_get_dt(&buttons[1]);
+
+        if (b0_pressed && b1_pressed) {
+            is_sleeping = false;
+            LOG_INF(">>> SIMULTANEOUS PRESS DETECTED! WAKING UP! <<<");
+            reset_inactivity_timer();
+        }
+    }
+}
+
+/* ================= GPIO LOGIC ================= */
+
 static void button_pressed(const struct device *dev,
                            struct gpio_callback *cb,
                            uint32_t pins)
 {
+    if (is_sleeping) {
+        // If asleep, ignore normal logic and schedule a check for dual-press
+        k_work_reschedule(&button_check_work, BUTTON_DEBOUNCE);
+        return;
+    }
+
+    // If awake, reset the sleep timer due to user interaction
+    reset_inactivity_timer();
+
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
-
         if (pins & BIT(buttons[i].pin)) {
-
             if (compartments[i].is_open) {
                 gpio_pin_set_dt(&leds[i], 0);
                 compartments[i].is_open = false;
-
                 LOG_INF("HARDWARE: Compartment %d physically CLOSED by user", i);
             } else {
                 LOG_INF("HARDWARE: Button %d pressed, but compartment is already closed", i);
@@ -67,8 +116,6 @@ static void button_pressed(const struct device *dev,
         }
     }
 }
-
-/* ================= GPIO ================= */
 
 static void close_compartment(int id)
 {
@@ -79,8 +126,6 @@ static void close_compartment(int id)
     compartments[id].is_open = false;
 }
 
-/* ================= INIT ================= */
-
 static void init_compartments(void)
 {
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
@@ -89,7 +134,7 @@ static void init_compartments(void)
     }
 }
 
-/* ================= STATUS ================= */
+/* ================= HTTP ENDPOINTS ================= */
 
 static int on_locker_status(struct http_client_ctx *client,
                             enum http_data_status status,
@@ -99,9 +144,17 @@ static int on_locker_status(struct http_client_ctx *client,
 {
     static char body[128];
 
-    if (status != HTTP_SERVER_DATA_FINAL)
-        return 0;
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
 
+    if (is_sleeping) {
+        LOG_WRN("API REJECTED: Locker is sleeping!");
+        res->status = HTTP_503_SERVICE_UNAVAILABLE;
+        res->body_len = 0;
+        res->final_chunk = true;
+        return 0;
+    }
+
+    reset_inactivity_timer(); // Interaction detected, reset timer
     LOG_INF("API REQUEST: GET /locker/status");
 
     int len = snprintf(body, sizeof(body),
@@ -114,11 +167,8 @@ static int on_locker_status(struct http_client_ctx *client,
     res->final_chunk = true;
 
     LOG_INF("API RESPONSE: %s", body);
-
     return 0;
 }
-
-/* ================= LIST ================= */
 
 static int on_compartments_list(struct http_client_ctx *client,
                                 enum http_data_status status,
@@ -128,25 +178,28 @@ static int on_compartments_list(struct http_client_ctx *client,
 {
     static char body[256];
 
-    if (status != HTTP_SERVER_DATA_FINAL)
-        return 0;
+    if (status != HTTP_SERVER_DATA_FINAL) return 0;
 
+    if (is_sleeping) {
+        LOG_WRN("API REJECTED: Locker is sleeping!");
+        res->status = HTTP_503_SERVICE_UNAVAILABLE;
+        res->body_len = 0;
+        res->final_chunk = true;
+        return 0;
+    }
+
+    reset_inactivity_timer();
     LOG_INF("API REQUEST: GET /compartments");
 
     int offset = 0;
-
     offset += snprintf(body + offset, sizeof(body) - offset, "[");
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
-
-        offset += snprintf(body + offset,
-                           sizeof(body) - offset,
+        offset += snprintf(body + offset, sizeof(body) - offset,
                            "{\"id\":%d,\"state\":\"%s\"}%s",
-                           i,
-                           compartments[i].is_open ? "open" : "closed",
+                           i, compartments[i].is_open ? "open" : "closed",
                            (i < COMPARTMENT_COUNT - 1) ? "," : "");
     }
-
     offset += snprintf(body + offset, sizeof(body) - offset, "]");
 
     res->status = HTTP_200_OK;
@@ -155,16 +208,22 @@ static int on_compartments_list(struct http_client_ctx *client,
     res->final_chunk = true;
 
     LOG_INF("API RESPONSE: %s", body);
-
     return 0;
 }
-
-/* ================= OPEN ================= */
 
 static int open_compartment(int id, struct http_response_ctx *res)
 {
     static char body[64];
 
+    if (is_sleeping) {
+        LOG_WRN("API REJECTED: Locker is sleeping!");
+        res->status = HTTP_503_SERVICE_UNAVAILABLE;
+        res->body_len = 0;
+        res->final_chunk = true;
+        return 0;
+    }
+
+    reset_inactivity_timer();
     LOG_INF("API REQUEST: POST /compartments/%d/open", id);
 
     if (id < 0 || id >= COMPARTMENT_COUNT) {
@@ -173,12 +232,10 @@ static int open_compartment(int id, struct http_response_ctx *res)
         return 0;
     }
 
-    /* Direct, non-blocking hardware toggle resolves the race condition */
     gpio_pin_set_dt(&leds[id], 1);
     compartments[id].is_open = true;
 
-    int len = snprintf(body, sizeof(body),
-        "{\"status\":\"opened\",\"id\":%d}", id);
+    int len = snprintf(body, sizeof(body), "{\"status\":\"opened\",\"id\":%d}", id);
 
     res->status = HTTP_200_OK;
     res->body = (uint8_t *)body;
@@ -186,7 +243,6 @@ static int open_compartment(int id, struct http_response_ctx *res)
     res->final_chunk = true;
 
     LOG_INF("API RESPONSE: %s", body);
-
     return 0;
 }
 
@@ -194,6 +250,15 @@ static int close_compartment_api(int id, struct http_response_ctx *res)
 {
     static char body[64];
 
+    if (is_sleeping) {
+        LOG_WRN("API REJECTED: Locker is sleeping!");
+        res->status = HTTP_503_SERVICE_UNAVAILABLE;
+        res->body_len = 0;
+        res->final_chunk = true;
+        return 0;
+    }
+
+    reset_inactivity_timer();
     LOG_INF("API REQUEST: POST /compartments/%d/close", id);
 
     if (id < 0 || id >= COMPARTMENT_COUNT) {
@@ -204,8 +269,7 @@ static int close_compartment_api(int id, struct http_response_ctx *res)
 
     close_compartment(id);
 
-    int len = snprintf(body, sizeof(body),
-        "{\"status\":\"closed\",\"id\":%d}", id);
+    int len = snprintf(body, sizeof(body), "{\"status\":\"closed\",\"id\":%d}", id);
 
     res->status = HTTP_200_OK;
     res->body = (uint8_t *)body;
@@ -213,11 +277,10 @@ static int close_compartment_api(int id, struct http_response_ctx *res)
     res->final_chunk = true;
 
     LOG_INF("API RESPONSE: %s", body);
-
     return 0;
 }
 
-/* ================= CALLBACKS ================= */
+/* ================= CALLBACKS & SERVER DEF ================= */
 
 #define OPEN_CB(ID) \
 static int open##ID##_cb(struct http_client_ctx *client, \
@@ -241,91 +304,49 @@ static int close##ID##_cb(struct http_client_ctx *client, \
     return close_compartment_api(ID, res); \
 }
 
-OPEN_CB(0)
-OPEN_CB(1)
-OPEN_CB(2)
-OPEN_CB(3)
-
-CLOSE_CB(0)
-CLOSE_CB(1)
-CLOSE_CB(2)
-CLOSE_CB(3)
-
-/* ================= HTTP SERVER ================= */
+OPEN_CB(0) OPEN_CB(1) OPEN_CB(2) OPEN_CB(3)
+CLOSE_CB(0) CLOSE_CB(1) CLOSE_CB(2) CLOSE_CB(3)
 
 static uint16_t service_port = 8080;
-
 HTTP_SERVICE_DEFINE(locker_svc, "0.0.0.0", &service_port, 2, 10, NULL, NULL, NULL);
 
 static struct http_resource_detail_dynamic status_detail = {
-    .common = {
-        .type = HTTP_RESOURCE_TYPE_DYNAMIC,
-        .bitmask_of_supported_http_methods = BIT(HTTP_GET),
-    },
+    .common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC, .bitmask_of_supported_http_methods = BIT(HTTP_GET), },
     .cb = on_locker_status,
 };
-
 HTTP_RESOURCE_DEFINE(status_resource, locker_svc, "/locker/status", &status_detail);
 
 static struct http_resource_detail_dynamic list_detail = {
-    .common = {
-        .type = HTTP_RESOURCE_TYPE_DYNAMIC,
-        .bitmask_of_supported_http_methods = BIT(HTTP_GET),
-    },
+    .common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC, .bitmask_of_supported_http_methods = BIT(HTTP_GET), },
     .cb = on_compartments_list,
 };
-
 HTTP_RESOURCE_DEFINE(list_resource, locker_svc, "/compartments", &list_detail);
-
-/* ===== OPEN endpoints ===== */
 
 #define OPEN_RESOURCE(ID) \
 static struct http_resource_detail_dynamic open##ID##_detail = { \
-    .common = { \
-        .type = HTTP_RESOURCE_TYPE_DYNAMIC, \
-        .bitmask_of_supported_http_methods = BIT(HTTP_POST), \
-    }, \
+    .common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC, .bitmask_of_supported_http_methods = BIT(HTTP_POST), }, \
     .cb = open##ID##_cb, \
 }; \
-HTTP_RESOURCE_DEFINE(open##ID##_resource, \
-                     locker_svc, \
-                     "/compartments/"#ID"/open", \
-                     &open##ID##_detail);
+HTTP_RESOURCE_DEFINE(open##ID##_resource, locker_svc, "/compartments/"#ID"/open", &open##ID##_detail);
 
-OPEN_RESOURCE(0)
-OPEN_RESOURCE(1)
-OPEN_RESOURCE(2)
-OPEN_RESOURCE(3)
-
-/* ===== CLOSE endpoints ===== */
+OPEN_RESOURCE(0) OPEN_RESOURCE(1) OPEN_RESOURCE(2) OPEN_RESOURCE(3)
 
 #define CLOSE_RESOURCE(ID) \
 static struct http_resource_detail_dynamic close##ID##_detail = { \
-    .common = { \
-        .type = HTTP_RESOURCE_TYPE_DYNAMIC, \
-        .bitmask_of_supported_http_methods = BIT(HTTP_POST), \
-    }, \
+    .common = { .type = HTTP_RESOURCE_TYPE_DYNAMIC, .bitmask_of_supported_http_methods = BIT(HTTP_POST), }, \
     .cb = close##ID##_cb, \
 }; \
-HTTP_RESOURCE_DEFINE(close##ID##_resource, \
-                     locker_svc, \
-                     "/compartments/"#ID"/close", \
-                     &close##ID##_detail);
+HTTP_RESOURCE_DEFINE(close##ID##_resource, locker_svc, "/compartments/"#ID"/close", &close##ID##_detail);
 
-CLOSE_RESOURCE(0)
-CLOSE_RESOURCE(1)
-CLOSE_RESOURCE(2)
-CLOSE_RESOURCE(3)
+CLOSE_RESOURCE(0) CLOSE_RESOURCE(1) CLOSE_RESOURCE(2) CLOSE_RESOURCE(3)
 
 /* ================= LTE ================= */
 
 static void lte_handler(const struct lte_lc_evt *evt)
 {
     if (evt->type == LTE_LC_EVT_NW_REG_STATUS) {
-
         if (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ||
             evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
-
             LOG_INF("Network attached");
             k_sem_give(&lte_connected);
         }
@@ -338,59 +359,49 @@ int main(void)
 {
     int err;
 
-    LOG_INF("Cellular Locker Demo");
+    LOG_INF("Cellular Locker Demo - With Sleep Mode");
+
+    k_timer_init(&inactivity_timer, inactivity_timer_handler, NULL);
+    k_work_init_delayable(&button_check_work, button_check_handler);
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
-
-        if (!device_is_ready(leds[i].port)) {
-            LOG_ERR("LED %d not ready", i);
-            continue;
-        }
-
+        if (!device_is_ready(leds[i].port)) continue;
         gpio_pin_configure_dt(&leds[i], GPIO_OUTPUT_INACTIVE);
     }
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
-
-        if (!device_is_ready(buttons[i].port)) {
-            LOG_ERR("Button %d not ready", i);
-            continue;
-        }
-
+        if (!device_is_ready(buttons[i].port)) continue;
         gpio_pin_configure_dt(&buttons[i], GPIO_INPUT);
-
-        gpio_pin_interrupt_configure_dt(&buttons[i],
-                                        GPIO_INT_EDGE_TO_ACTIVE);
-
-        gpio_init_callback(&button_cb_data[i],
-                           button_pressed,
-                           BIT(buttons[i].pin));
-
-        gpio_add_callback(buttons[i].port,
-                          &button_cb_data[i]);
+        gpio_pin_interrupt_configure_dt(&buttons[i], GPIO_INT_EDGE_TO_ACTIVE);
+        gpio_init_callback(&button_cb_data[i], button_pressed, BIT(buttons[i].pin));
+        gpio_add_callback(buttons[i].port, &button_cb_data[i]);
     }
 
     init_compartments();
 
     err = nrf_modem_lib_init();
-    if (err)
-        return err;
+    if (err) return err;
 
     err = lte_lc_connect_async(lte_handler);
-    if (err)
-        return err;
+    if (err) return err;
 
     k_sem_take(&lte_connected, K_FOREVER);
-
     LOG_INF("LTE Connected");
 
     err = http_server_start();
-
-    if (err)
+    if (err) {
         LOG_ERR("HTTP server failed");
-    else
+    } else {
         LOG_INF("HTTP server started on port %d", service_port);
+    }
 
-    while (1)
+    // Start the system Awake
+    is_sleeping = false;
+    reset_inactivity_timer();
+    LOG_INF("App logic awake. 60s inactivity timer started.");
+
+    // The MCU will automatically enter System ON Idle during k_sleep
+    while (1) {
         k_sleep(K_SECONDS(1));
+    }
 }
