@@ -52,6 +52,7 @@ static struct compartment compartments[COMPARTMENT_COUNT];
 
 static struct k_timer inactivity_timer;
 static struct k_work_delayable button_check_work;
+static struct k_work sleep_work; // <--- NEW: Work item to handle modem sleep
 static bool is_sleeping = false;
 
 #define INACTIVITY_TIMEOUT K_SECONDS(60)
@@ -64,14 +65,29 @@ static void reset_inactivity_timer(void)
     }
 }
 
-static void inactivity_timer_handler(struct k_timer *timer_id)
+/* NEW: This runs in the workqueue thread, safe to block the modem here */
+static void sleep_work_handler(struct k_work *work)
 {
-    is_sleeping = true;
     LOG_WRN("=========================================");
     LOG_WRN("   60s INACTIVITY REACHED");
     LOG_WRN("   Locker is now in APP SLEEP STATE");
-    LOG_WRN("   Press Button 0 + Button 1 to wake");
+    LOG_WRN("   Turning off LTE Modem (Airplane mode)...");
+    
+    // Turn off modem radio
+    int err = lte_lc_offline();
+    if (err) {
+        LOG_ERR("Failed to turn off modem: %d", err);
+    }
+    
+    LOG_WRN("   Modem is OFF. Press Button 0 + 1 to wake.");
     LOG_WRN("=========================================");
+}
+
+/* Timer ISR - must be fast, no blocking */
+static void inactivity_timer_handler(struct k_timer *timer_id)
+{
+    is_sleeping = true;
+    k_work_submit(&sleep_work); // Hand off to the workqueue thread
 }
 
 static void button_check_handler(struct k_work *work)
@@ -84,6 +100,14 @@ static void button_check_handler(struct k_work *work)
         if (b0_pressed && b1_pressed) {
             is_sleeping = false;
             LOG_INF(">>> SIMULTANEOUS PRESS DETECTED! WAKING UP! <<<");
+            LOG_INF(">>> Turning LTE Modem back ON... <<<");
+            
+            // Turn the modem radio back on
+            int err = lte_lc_normal();
+            if (err) {
+                LOG_ERR("Failed to turn on modem: %d", err);
+            }
+
             reset_inactivity_timer();
         }
     }
@@ -96,12 +120,10 @@ static void button_pressed(const struct device *dev,
                            uint32_t pins)
 {
     if (is_sleeping) {
-        // If asleep, ignore normal logic and schedule a check for dual-press
         k_work_reschedule(&button_check_work, BUTTON_DEBOUNCE);
         return;
     }
 
-    // If awake, reset the sleep timer due to user interaction
     reset_inactivity_timer();
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
@@ -154,7 +176,7 @@ static int on_locker_status(struct http_client_ctx *client,
         return 0;
     }
 
-    reset_inactivity_timer(); // Interaction detected, reset timer
+    reset_inactivity_timer();
     LOG_INF("API REQUEST: GET /locker/status");
 
     int len = snprintf(body, sizeof(body),
@@ -344,12 +366,22 @@ CLOSE_RESOURCE(0) CLOSE_RESOURCE(1) CLOSE_RESOURCE(2) CLOSE_RESOURCE(3)
 
 static void lte_handler(const struct lte_lc_evt *evt)
 {
-    if (evt->type == LTE_LC_EVT_NW_REG_STATUS) {
+    switch (evt->type) {
+    case LTE_LC_EVT_NW_REG_STATUS:
         if (evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ||
             evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_ROAMING) {
-            LOG_INF("Network attached");
+            
+            LOG_INF("--- LTE Network Attached! API is now reachable ---");
             k_sem_give(&lte_connected);
+            
+        } else if (evt->nw_reg_status == LTE_LC_NW_REG_NOT_REGISTERED ||
+                   evt->nw_reg_status == LTE_LC_NW_REG_SEARCHING) {
+            
+            LOG_INF("--- LTE Network Disconnected / Searching ---");
         }
+        break;
+    default:
+        break;
     }
 }
 
@@ -359,10 +391,11 @@ int main(void)
 {
     int err;
 
-    LOG_INF("Cellular Locker Demo - With Sleep Mode");
+    LOG_INF("Cellular Locker Demo - Step 3 (LTE Power Control)");
 
     k_timer_init(&inactivity_timer, inactivity_timer_handler, NULL);
     k_work_init_delayable(&button_check_work, button_check_handler);
+    k_work_init(&sleep_work, sleep_work_handler); // Initialize new sleep workqueue
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         if (!device_is_ready(leds[i].port)) continue;
@@ -386,7 +419,7 @@ int main(void)
     if (err) return err;
 
     k_sem_take(&lte_connected, K_FOREVER);
-    LOG_INF("LTE Connected");
+    LOG_INF("LTE Connected for the first time");
 
     err = http_server_start();
     if (err) {
@@ -395,12 +428,10 @@ int main(void)
         LOG_INF("HTTP server started on port %d", service_port);
     }
 
-    // Start the system Awake
     is_sleeping = false;
     reset_inactivity_timer();
     LOG_INF("App logic awake. 60s inactivity timer started.");
 
-    // The MCU will automatically enter System ON Idle during k_sleep
     while (1) {
         k_sleep(K_SECONDS(1));
     }
