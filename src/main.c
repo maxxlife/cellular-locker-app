@@ -27,12 +27,45 @@ static const struct gpio_dt_spec leds[COMPARTMENT_COUNT] = {
     GPIO_DT_SPEC_GET(LED3_NODE, gpios),
 };
 
+#define SW0_NODE DT_ALIAS(sw0)
+#define SW1_NODE DT_ALIAS(sw1)
+#define SW2_NODE DT_ALIAS(sw2)
+#define SW3_NODE DT_ALIAS(sw3)
+
+static const struct gpio_dt_spec buttons[COMPARTMENT_COUNT] = {
+    GPIO_DT_SPEC_GET(SW0_NODE, gpios),
+    GPIO_DT_SPEC_GET(SW1_NODE, gpios),
+    GPIO_DT_SPEC_GET(SW2_NODE, gpios),
+    GPIO_DT_SPEC_GET(SW3_NODE, gpios),
+};
+
+static struct gpio_callback button_cb_data[COMPARTMENT_COUNT];
+
 struct compartment {
     int id;
     bool is_open;
 };
 
 static struct compartment compartments[COMPARTMENT_COUNT];
+
+static void button_pressed(const struct device *dev,
+                           struct gpio_callback *cb,
+                           uint32_t pins)
+{
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+
+        if (pins & BIT(buttons[i].pin)) {
+
+            if (compartments[i].is_open) {
+
+                gpio_pin_set_dt(&leds[i], 0);
+                compartments[i].is_open = false;
+
+                LOG_INF("Compartment %d closed by user", i);
+            }
+        }
+    }
+}
 
 /* ================= GPIO ================= */
 
@@ -297,6 +330,26 @@ int main(void)
 
         gpio_pin_configure_dt(&leds[i], GPIO_OUTPUT_INACTIVE);
     }
+
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+
+    if (!device_is_ready(buttons[i].port)) {
+        LOG_ERR("Button %d not ready", i);
+        continue;
+    }
+
+    gpio_pin_configure_dt(&buttons[i], GPIO_INPUT);
+
+    gpio_pin_interrupt_configure_dt(&buttons[i],
+                                    GPIO_INT_EDGE_TO_ACTIVE);
+
+    gpio_init_callback(&button_cb_data[i],
+                       button_pressed,
+                       BIT(buttons[i].pin));
+
+    gpio_add_callback(buttons[i].port,
+                      &button_cb_data[i]);
+}
 
     init_compartments();
 
