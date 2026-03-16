@@ -10,6 +10,15 @@
 #include <modem/nrf_modem_lib.h>
 #include <modem/sms.h>
 #include <stdio.h>
+#include <zephyr/sys/reboot.h>
+
+/* ================= SECURITY CONFIG ================= */
+#define SMS_SECRET_KEY_WAKE "WK_1234"
+#define SMS_SECRET_KEY_RESET "RST_1234"
+
+#define CMD_WAKE  "WAKE:" SMS_SECRET_KEY_WAKE
+#define CMD_RESET "RESET:" SMS_SECRET_KEY_RESET
+/* =================================================== */
 
 LOG_MODULE_REGISTER(locker_app, LOG_LEVEL_INF);
 
@@ -86,10 +95,10 @@ static void wake_network(void)
         LOG_INF("Network radio awakened via dummy UDP uplink packet");
     }
 }
-
 /* SMS Receive Handler */
 static void sms_callback(struct sms_data *const data, void *context)
 {
+    // The struct itself can be NULL, but the payload array cannot.
     if (data == NULL) return;
 
     LOG_INF("=========================================");
@@ -97,15 +106,38 @@ static void sms_callback(struct sms_data *const data, void *context)
     LOG_INF("   Payload: %.*s", data->payload_len, data->payload);
     LOG_INF("=========================================");
 
-    // Do NOT call k_free(data->payload) here! 
-    // The modem library manages this memory across the TrustZone boundary.
+    // SECURITY LAYER: Token Payload Verification
 
-    if (is_sleeping) {
-        is_sleeping = false;
-        LOG_INF(">>> SMS WAKEUP DETECTED! WAKING UP APP! <<<");
-        wake_network();
-        reset_inactivity_timer();
+    // 1. Check for Authorized RESET command
+    if (data->payload_len >= strlen(CMD_RESET) && 
+        strncmp(data->payload, CMD_RESET, strlen(CMD_RESET)) == 0) {
+        
+        LOG_WRN(">>> SMS COMMAND: AUTHORIZED RESET RECEIVED! REBOOTING... <<<");
+        
+        // Give the UART 200ms to finish printing the log message before pulling the plug
+        k_sleep(K_MSEC(200)); 
+        
+        sys_reboot(SYS_REBOOT_COLD); 
+        return; 
     }
+
+    // 2. Check for Authorized WAKE command
+    if (data->payload_len >= strlen(CMD_WAKE) && 
+        strncmp(data->payload, CMD_WAKE, strlen(CMD_WAKE)) == 0) {
+        
+        if (is_sleeping) {
+            is_sleeping = false;
+            LOG_INF(">>> AUTHORIZED SMS WAKEUP DETECTED! WAKING UP APP! <<<");
+            wake_network();
+            reset_inactivity_timer();
+        } else {
+            LOG_INF("WAKE command received, but app is already awake.");
+        }
+        return;
+    }
+
+    // 3. Unauthorized or garbage SMS
+    LOG_WRN("Unauthorized or unrecognized SMS payload token. Ignoring.");
 }
 
 static void sleep_work_handler(struct k_work *work)
