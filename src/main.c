@@ -64,6 +64,8 @@ static struct compartment compartments[COMPARTMENT_COUNT];
 static struct k_timer inactivity_timer;
 static struct k_work_delayable button_check_work;
 static struct k_work sleep_work;
+static struct k_work wake_work; 
+static struct k_work reset_work; // <--- NEW: Dedicated workqueue for resetting
 static bool is_sleeping = false;
 
 #define INACTIVITY_TIMEOUT K_SECONDS(60)
@@ -76,10 +78,76 @@ static void reset_inactivity_timer(void)
     }
 }
 
-/* Sends a dummy UDP packet. This forces the modem out of PSM/eDRX sleep
- * and into RRC Connected state, instantly opening up the network routing
- * so our HTTP server can receive incoming TCP requests again.
- */
+/* Restores the LEDs to match the actual compartment open/close states */
+static void restore_led_states(void)
+{
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+        gpio_pin_set_dt(&leds[i], compartments[i].is_open ? 1 : 0);
+    }
+}
+
+/* UX Animation 1: Double blink all LEDs to signal going to sleep */
+static void play_sleep_animation(void)
+{
+    LOG_INF("UX: Playing Sleep Animation");
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < COMPARTMENT_COUNT; j++) {
+            gpio_pin_set_dt(&leds[j], 1);
+        }
+        k_sleep(K_MSEC(150));
+        
+        for (int j = 0; j < COMPARTMENT_COUNT; j++) {
+            gpio_pin_set_dt(&leds[j], 0);
+        }
+        k_sleep(K_MSEC(150));
+    }
+    restore_led_states();
+}
+
+/* UX Animation 2: Sequential sweep (0->3) then flash, to signal waking up */
+static void play_wake_animation(void)
+{
+    LOG_INF("UX: Playing Wake Animation");
+    
+    // Sweep effect
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+        gpio_pin_set_dt(&leds[i], 1);
+        k_sleep(K_MSEC(80));
+        gpio_pin_set_dt(&leds[i], 0);
+    }
+    
+    // Final flash
+    for (int i = 0; i < COMPARTMENT_COUNT; i++) {
+        gpio_pin_set_dt(&leds[i], 1);
+    }
+    k_sleep(K_MSEC(200));
+    
+    restore_led_states();
+}
+
+/* UX Animation 3: Fast alternating strobe (Odds vs Evens) to signal a HARD RESET */
+static void play_reset_animation(void)
+{
+    LOG_INF("UX: Playing Reset (Reboot) Animation");
+    
+    // Alternate Odds/Evens 3 times rapidly
+    for (int i = 0; i < 3; i++) {
+        gpio_pin_set_dt(&leds[0], 1); gpio_pin_set_dt(&leds[2], 1);
+        gpio_pin_set_dt(&leds[1], 0); gpio_pin_set_dt(&leds[3], 0);
+        k_sleep(K_MSEC(100));
+        
+        gpio_pin_set_dt(&leds[0], 0); gpio_pin_set_dt(&leds[2], 0);
+        gpio_pin_set_dt(&leds[1], 1); gpio_pin_set_dt(&leds[3], 1);
+        k_sleep(K_MSEC(100));
+    }
+    
+    // Turn all LEDs ON solidly for the final 500ms before the plug gets pulled
+    for (int j = 0; j < COMPARTMENT_COUNT; j++) {
+        gpio_pin_set_dt(&leds[j], 1);
+    }
+    k_sleep(K_MSEC(500)); 
+}
+
 static void wake_network(void)
 {
     int sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -88,56 +156,39 @@ static void wake_network(void)
             .sin_family = AF_INET,
             .sin_port = htons(8080),
         };
-        // Dummy IP, we just need the radio to transmit *something* uplink
         zsock_inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
         zsock_sendto(sock, "WAKE", 4, 0, (struct sockaddr *)&addr, sizeof(addr));
         zsock_close(sock);
         LOG_INF("Network radio awakened via dummy UDP uplink packet");
     }
 }
-/* SMS Receive Handler */
-static void sms_callback(struct sms_data *const data, void *context)
+
+/* Dedicated handler to safely process wake up events outside of interrupts */
+static void wake_work_handler(struct k_work *work)
 {
-    // The struct itself can be NULL, but the payload array cannot.
-    if (data == NULL) return;
+    LOG_INF(">>> EXECUTING WAKEUP SEQUENCE <<<");
+    play_wake_animation();
+    wake_network();
+    reset_inactivity_timer();
+}
 
-    LOG_INF("=========================================");
-    LOG_INF("   SMS RECEIVED!");
-    LOG_INF("   Payload: %.*s", data->payload_len, data->payload);
-    LOG_INF("=========================================");
+/* Dedicated handler for Reboot. This prevents crashing the SMS interrupt handler */
+static void reset_work_handler(struct k_work *work)
+{
+    LOG_WRN(">>> EXECUTING SYSTEM REBOOT SEQUENCE <<<");
+    play_reset_animation();
+    
+    // We do NOT restore LED states here, because the chip is about to die anyway.
+    sys_reboot(SYS_REBOOT_COLD);
+}
 
-    // SECURITY LAYER: Token Payload Verification
-
-    // 1. Check for Authorized RESET command
-    if (data->payload_len >= strlen(CMD_RESET) && 
-        strncmp(data->payload, CMD_RESET, strlen(CMD_RESET)) == 0) {
-        
-        LOG_WRN(">>> SMS COMMAND: AUTHORIZED RESET RECEIVED! REBOOTING... <<<");
-        
-        // Give the UART 200ms to finish printing the log message before pulling the plug
-        k_sleep(K_MSEC(200)); 
-        
-        sys_reboot(SYS_REBOOT_COLD); 
-        return; 
+/* Helper to trigger the wake process instantly */
+static void trigger_wakeup(void)
+{
+    if (is_sleeping) {
+        is_sleeping = false; 
+        k_work_submit(&wake_work);
     }
-
-    // 2. Check for Authorized WAKE command
-    if (data->payload_len >= strlen(CMD_WAKE) && 
-        strncmp(data->payload, CMD_WAKE, strlen(CMD_WAKE)) == 0) {
-        
-        if (is_sleeping) {
-            is_sleeping = false;
-            LOG_INF(">>> AUTHORIZED SMS WAKEUP DETECTED! WAKING UP APP! <<<");
-            wake_network();
-            reset_inactivity_timer();
-        } else {
-            LOG_INF("WAKE command received, but app is already awake.");
-        }
-        return;
-    }
-
-    // 3. Unauthorized or garbage SMS
-    LOG_WRN("Unauthorized or unrecognized SMS payload token. Ignoring.");
 }
 
 static void sleep_work_handler(struct k_work *work)
@@ -148,12 +199,50 @@ static void sleep_work_handler(struct k_work *work)
     LOG_WRN("   Modem dropping to eDRX (10.24s cycle).");
     LOG_WRN("   Waiting for SMS or Button 0+1 to wake...");
     LOG_WRN("=========================================");
+    
+    play_sleep_animation();
 }
 
 static void inactivity_timer_handler(struct k_timer *timer_id)
 {
     is_sleeping = true;
     k_work_submit(&sleep_work);
+}
+
+/* ================= SMS & BUTTON HANDLERS ================= */
+
+static void sms_callback(struct sms_data *const data, void *context)
+{
+    if (data == NULL) return;
+
+    LOG_INF("=========================================");
+    LOG_INF("   SMS RECEIVED!");
+    LOG_INF("   Payload: %.*s", data->payload_len, data->payload);
+    LOG_INF("=========================================");
+
+    // 1. Check for RESET
+    if (data->payload_len >= strlen(CMD_RESET) && 
+        strncmp(data->payload, CMD_RESET, strlen(CMD_RESET)) == 0) {
+        
+        LOG_WRN(">>> AUTHORIZED RESET COMMAND DETECTED! <<<");
+        // Safely pass the reboot task to the workqueue (so LEDs can animate safely)
+        k_work_submit(&reset_work); 
+        return; 
+    }
+
+    // 2. Check for WAKE
+    if (data->payload_len >= strlen(CMD_WAKE) && 
+        strncmp(data->payload, CMD_WAKE, strlen(CMD_WAKE)) == 0) {
+        if (is_sleeping) {
+            LOG_INF(">>> AUTHORIZED SMS WAKEUP DETECTED! <<<");
+            trigger_wakeup();
+        } else {
+            LOG_INF("WAKE command received, but app is already awake.");
+        }
+        return;
+    }
+
+    LOG_WRN("Unauthorized or unrecognized SMS payload token. Ignoring.");
 }
 
 static void button_check_handler(struct k_work *work)
@@ -163,10 +252,8 @@ static void button_check_handler(struct k_work *work)
         int b1_pressed = gpio_pin_get_dt(&buttons[1]);
 
         if (b0_pressed && b1_pressed) {
-            is_sleeping = false;
-            LOG_INF(">>> SIMULTANEOUS PRESS DETECTED! WAKING UP APP! <<<");
-            wake_network();
-            reset_inactivity_timer();
+            LOG_INF(">>> SIMULTANEOUS PRESS DETECTED! <<<");
+            trigger_wakeup();
         }
     }
 }
@@ -366,11 +453,13 @@ int main(void)
 {
     int err;
 
-    LOG_INF("Cellular Locker Demo - Step 4 (eDRX + SMS Wake)");
-
+    LOG_INF("Cellular Locker Demo - Step 4 (eDRX + SMS Wake + LED UX)");
+    
     k_timer_init(&inactivity_timer, inactivity_timer_handler, NULL);
     k_work_init_delayable(&button_check_work, button_check_handler);
     k_work_init(&sleep_work, sleep_work_handler);
+    k_work_init(&wake_work, wake_work_handler);
+    k_work_init(&reset_work, reset_work_handler);
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         if (!device_is_ready(leds[i].port)) continue;
