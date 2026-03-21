@@ -65,7 +65,7 @@ static struct k_timer inactivity_timer;
 static struct k_work_delayable button_check_work;
 static struct k_work sleep_work;
 static struct k_work wake_work; 
-static struct k_work reset_work; // <--- NEW: Dedicated workqueue for resetting
+static struct k_work reset_work; 
 static bool is_sleeping = false;
 
 #define INACTIVITY_TIMEOUT K_SECONDS(60)
@@ -78,7 +78,6 @@ static void reset_inactivity_timer(void)
     }
 }
 
-/* Restores the LEDs to match the actual compartment open/close states */
 static void restore_led_states(void)
 {
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
@@ -86,7 +85,6 @@ static void restore_led_states(void)
     }
 }
 
-/* UX Animation 1: Double blink all LEDs to signal going to sleep */
 static void play_sleep_animation(void)
 {
     LOG_INF("UX: Playing Sleep Animation");
@@ -104,19 +102,16 @@ static void play_sleep_animation(void)
     restore_led_states();
 }
 
-/* UX Animation 2: Sequential sweep (0->3) then flash, to signal waking up */
 static void play_wake_animation(void)
 {
     LOG_INF("UX: Playing Wake Animation");
     
-    // Sweep effect
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         gpio_pin_set_dt(&leds[i], 1);
         k_sleep(K_MSEC(80));
         gpio_pin_set_dt(&leds[i], 0);
     }
     
-    // Final flash
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         gpio_pin_set_dt(&leds[i], 1);
     }
@@ -125,12 +120,10 @@ static void play_wake_animation(void)
     restore_led_states();
 }
 
-/* UX Animation 3: Fast alternating strobe (Odds vs Evens) to signal a HARD RESET */
 static void play_reset_animation(void)
 {
     LOG_INF("UX: Playing Reset (Reboot) Animation");
     
-    // Alternate Odds/Evens 3 times rapidly
     for (int i = 0; i < 3; i++) {
         gpio_pin_set_dt(&leds[0], 1); gpio_pin_set_dt(&leds[2], 1);
         gpio_pin_set_dt(&leds[1], 0); gpio_pin_set_dt(&leds[3], 0);
@@ -141,7 +134,6 @@ static void play_reset_animation(void)
         k_sleep(K_MSEC(100));
     }
     
-    // Turn all LEDs ON solidly for the final 500ms before the plug gets pulled
     for (int j = 0; j < COMPARTMENT_COUNT; j++) {
         gpio_pin_set_dt(&leds[j], 1);
     }
@@ -163,7 +155,6 @@ static void wake_network(void)
     }
 }
 
-/* Dedicated handler to safely process wake up events outside of interrupts */
 static void wake_work_handler(struct k_work *work)
 {
     LOG_INF(">>> EXECUTING WAKEUP SEQUENCE <<<");
@@ -172,17 +163,13 @@ static void wake_work_handler(struct k_work *work)
     reset_inactivity_timer();
 }
 
-/* Dedicated handler for Reboot. This prevents crashing the SMS interrupt handler */
 static void reset_work_handler(struct k_work *work)
 {
     LOG_WRN(">>> EXECUTING SYSTEM REBOOT SEQUENCE <<<");
     play_reset_animation();
-    
-    // We do NOT restore LED states here, because the chip is about to die anyway.
     sys_reboot(SYS_REBOOT_COLD);
 }
 
-/* Helper to trigger the wake process instantly */
 static void trigger_wakeup(void)
 {
     if (is_sleeping) {
@@ -197,7 +184,7 @@ static void sleep_work_handler(struct k_work *work)
     LOG_WRN("   60s INACTIVITY REACHED");
     LOG_WRN("   Locker is now in APP SLEEP STATE");
     LOG_WRN("   Modem dropping to eDRX (10.24s cycle).");
-    LOG_WRN("   Waiting for SMS or Button 0+1 to wake...");
+    LOG_WRN("   Waiting for SMS, Button 0+1, or HTTP to wake...");
     LOG_WRN("=========================================");
     
     play_sleep_animation();
@@ -220,17 +207,14 @@ static void sms_callback(struct sms_data *const data, void *context)
     LOG_INF("   Payload: %.*s", data->payload_len, data->payload);
     LOG_INF("=========================================");
 
-    // 1. Check for RESET
     if (data->payload_len >= strlen(CMD_RESET) && 
         strncmp(data->payload, CMD_RESET, strlen(CMD_RESET)) == 0) {
         
         LOG_WRN(">>> AUTHORIZED RESET COMMAND DETECTED! <<<");
-        // Safely pass the reboot task to the workqueue (so LEDs can animate safely)
         k_work_submit(&reset_work); 
         return; 
     }
 
-    // 2. Check for WAKE
     if (data->payload_len >= strlen(CMD_WAKE) && 
         strncmp(data->payload, CMD_WAKE, strlen(CMD_WAKE)) == 0) {
         if (is_sleeping) {
@@ -258,26 +242,112 @@ static void button_check_handler(struct k_work *work)
     }
 }
 
-/* ================= GPIO LOGIC ================= */
+/* ================= GPIO LOGIC & KEYPAD FIX ================= */
+
+static void close_compartment(int id);
+
+// Internal helper logic separated from the HTTP API handler
+static void do_open_compartment(int id)
+{
+    if (id < 0 || id >= COMPARTMENT_COUNT) return;
+    gpio_pin_set_dt(&leds[id], 1);
+    compartments[id].is_open = true;
+}
+
+static bool is_typing_pin = false;
+static uint8_t pin_digits_entered = 0;
+static uint8_t current_pin_buffer[4];  // Array to hold entered digits
+static int last_pressed_button = -1;
+static int64_t last_button_press_time = 0; // Prevent hardware bounce
+static struct k_work_delayable keypad_timeout_work;
+
+#define KEYPAD_TIMEOUT K_SECONDS(3)
+
+static void keypad_timeout_handler(struct k_work *work)
+{
+    if (is_typing_pin) {
+        // If only 1 digit was entered and timer expires, treat it as a deliberate CLOSE action
+        if (pin_digits_entered == 1 && last_pressed_button != -1) {
+            if (compartments[last_pressed_button].is_open) {
+                close_compartment(last_pressed_button);
+                LOG_INF("HARDWARE: Compartment %d physically CLOSED by user (Timeout)", last_pressed_button);
+            }
+        } else {
+            LOG_INF("Keypad session timed out. Resetting state.");
+        }
+        
+        is_typing_pin = false;
+        pin_digits_entered = 0;
+        last_pressed_button = -1;
+    }
+}
 
 static void button_pressed(const struct device *dev,
                            struct gpio_callback *cb,
                            uint32_t pins)
 {
+    // Sleep combo bypasses debounce directly
     if (is_sleeping) {
         k_work_reschedule(&button_check_work, BUTTON_DEBOUNCE);
         return;
     }
 
+    // HARDWARE DEBOUNCING: Ignore if press happened < 250ms ago
+    int64_t now = k_uptime_get();
+    if (now - last_button_press_time < 250) {
+        return;
+    }
+    last_button_press_time = now;
+
     reset_inactivity_timer();
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         if (pins & BIT(buttons[i].pin)) {
-            if (compartments[i].is_open) {
-                gpio_pin_set_dt(&leds[i], 0);
-                compartments[i].is_open = false;
-                LOG_INF("HARDWARE: Compartment %d physically CLOSED by user", i);
+            
+            // Track Active Keypad Sessions
+            is_typing_pin = true;
+            current_pin_buffer[pin_digits_entered] = i; // Store digit
+            pin_digits_entered++;
+            last_pressed_button = i;
+            
+            LOG_INF("Keypad input: Button %d (Digit %d/4)", i, pin_digits_entered);
+            k_work_reschedule(&keypad_timeout_work, KEYPAD_TIMEOUT);
+
+            if (pin_digits_entered == 4) {
+                LOG_INF("4-digit PIN entry complete: %d-%d-%d-%d", 
+                        current_pin_buffer[0], current_pin_buffer[1], 
+                        current_pin_buffer[2], current_pin_buffer[3]);
+
+                // VALIDATE PIN 1: Buttons 1-2-3-4 (Indexes 0,1,2,3) -> Opens Cell 1 (Comp 0)
+                if (current_pin_buffer[0] == 0 && current_pin_buffer[1] == 1 && 
+                    current_pin_buffer[2] == 2 && current_pin_buffer[3] == 3) {
+                    LOG_INF(">>> Valid PIN! Opening Compartment 0 <<<");
+                    do_open_compartment(0);
+                }
+                // VALIDATE PIN 2: Buttons 4-3-2-1 (Indexes 3,2,1,0) -> Opens Cell 2 (Comp 1)
+                else if (current_pin_buffer[0] == 3 && current_pin_buffer[1] == 2 && 
+                         current_pin_buffer[2] == 1 && current_pin_buffer[3] == 0) {
+                    LOG_INF(">>> Valid PIN! Opening Compartment 1 <<<");
+                    do_open_compartment(1);
+                }
+                else {
+                    LOG_WRN(">>> Invalid PIN. Access Denied. <<<");
+                }
+
+                // Reset keypad state
+                is_typing_pin = false;
+                pin_digits_entered = 0;
+                last_pressed_button = -1;
+                k_work_cancel_delayable(&keypad_timeout_work);
+                return; 
             }
+
+            // Suppress the immediate door-close action while typing
+            if (compartments[i].is_open) {
+                LOG_INF("Suppressing immediate close for compartment %d (active PIN session)", i);
+            }
+
+            break; // Stop evaluating multiple pins to prevent multi-press errors
         }
     }
 }
@@ -306,7 +376,8 @@ static int on_locker_status(struct http_client_ctx *client, enum http_data_statu
     if (status != HTTP_SERVER_DATA_FINAL) return 0;
 
     if (is_sleeping) {
-        res->status = HTTP_503_SERVICE_UNAVAILABLE; res->body_len = 0; res->final_chunk = true; return 0;
+        LOG_INF(">>> WAKING UP VIA HTTP REQUEST (GET /locker/status) <<<");
+        trigger_wakeup();
     }
 
     reset_inactivity_timer();
@@ -326,7 +397,8 @@ static int on_compartments_list(struct http_client_ctx *client, enum http_data_s
     if (status != HTTP_SERVER_DATA_FINAL) return 0;
 
     if (is_sleeping) {
-        res->status = HTTP_503_SERVICE_UNAVAILABLE; res->body_len = 0; res->final_chunk = true; return 0;
+        LOG_INF(">>> WAKING UP VIA HTTP REQUEST (GET /compartments) <<<");
+        trigger_wakeup();
     }
 
     reset_inactivity_timer();
@@ -347,8 +419,10 @@ static int on_compartments_list(struct http_client_ctx *client, enum http_data_s
 static int open_compartment(int id, struct http_response_ctx *res)
 {
     static char body[64];
+    
     if (is_sleeping) {
-        res->status = HTTP_503_SERVICE_UNAVAILABLE; res->body_len = 0; res->final_chunk = true; return 0;
+        LOG_INF(">>> WAKING UP VIA HTTP REQUEST (POST /compartments/%d/open) <<<", id);
+        trigger_wakeup();
     }
 
     reset_inactivity_timer();
@@ -358,8 +432,7 @@ static int open_compartment(int id, struct http_response_ctx *res)
         res->status = HTTP_400_BAD_REQUEST; return 0;
     }
 
-    gpio_pin_set_dt(&leds[id], 1);
-    compartments[id].is_open = true;
+    do_open_compartment(id);
 
     int len = snprintf(body, sizeof(body), "{\"status\":\"opened\",\"id\":%d}", id);
     res->status = HTTP_200_OK; res->body = (uint8_t *)body; res->body_len = len; res->final_chunk = true;
@@ -369,8 +442,10 @@ static int open_compartment(int id, struct http_response_ctx *res)
 static int close_compartment_api(int id, struct http_response_ctx *res)
 {
     static char body[64];
+    
     if (is_sleeping) {
-        res->status = HTTP_503_SERVICE_UNAVAILABLE; res->body_len = 0; res->final_chunk = true; return 0;
+        LOG_INF(">>> WAKING UP VIA HTTP REQUEST (POST /compartments/%d/close) <<<", id);
+        trigger_wakeup();
     }
 
     reset_inactivity_timer();
@@ -460,6 +535,9 @@ int main(void)
     k_work_init(&sleep_work, sleep_work_handler);
     k_work_init(&wake_work, wake_work_handler);
     k_work_init(&reset_work, reset_work_handler);
+
+    // Initialize the new keypad timeout logic
+    k_work_init_delayable(&keypad_timeout_work, keypad_timeout_handler);
 
     for (int i = 0; i < COMPARTMENT_COUNT; i++) {
         if (!device_is_ready(leds[i].port)) continue;
